@@ -304,17 +304,30 @@ class ChildSafetyFilter:
 
 
 # ============================================================================
-# Intent Analyzer (LLM-powered)
+# Intent Analyzer (Hybrid Gemini + Qwen-VL)
 # ============================================================================
 
 class IntentAnalyzer:
     """
-    Analyzes user intent using LLM (Qwen)
+    Analyzes user intent using hybrid Gemini + Qwen-VL system
     """
 
-    def __init__(self, llm_base_url: str = "http://localhost:11434/v1"):
+    def __init__(self, llm_base_url: str = "http://localhost:11434/v1", use_router: bool = True):
         self.llm_base_url = llm_base_url
         self.client = httpx.AsyncClient(timeout=30.0)
+        self.use_router = use_router
+
+        # Initialize hybrid router if enabled
+        if self.use_router:
+            from llm_router import GeminiAnalyzer, QwenVLAnalyzer, MessageRouter
+
+            self.gemini = GeminiAnalyzer(model="gemini-1.5-flash")
+            self.qwen_vl = QwenVLAnalyzer(base_url="http://localhost:11434", model="qwen2-vl:latest")
+            self.router = MessageRouter(self.gemini, self.qwen_vl)
+            logger.info("Hybrid LLM routing enabled (Gemini + Qwen-VL)")
+        else:
+            self.router = None
+            logger.info("Using legacy Qwen-only mode")
 
     SYSTEM_PROMPT = """You are an AI assistant helping create children's storybook illustrations.
 
@@ -361,7 +374,7 @@ Respond in JSON format:
         current_params: Optional[GenerationParameters] = None
     ) -> Intent:
         """
-        Analyze user intent using LLM
+        Analyze user intent using hybrid LLM routing
 
         Args:
             user_message: Current user message
@@ -372,40 +385,139 @@ Respond in JSON format:
             Parsed intent
         """
         try:
-            # Build context
-            context = self._build_context(conversation_history, current_params)
-
-            # Call LLM
-            messages = [
-                {"role": "system", "content": self.SYSTEM_PROMPT},
-                {"role": "user", "content": context + "\n\nUser request: " + user_message}
-            ]
-
-            response = await self.client.post(
-                f"{self.llm_base_url}/chat/completions",
-                json={
-                    "model": "qwen2.5:latest",
-                    "messages": messages,
-                    "temperature": 0.3,  # Low temperature for consistent analysis
-                    "max_tokens": 500
-                }
-            )
-
-            if response.status_code != 200:
-                logger.error(f"LLM request failed: {response.status_code}")
-                return self._fallback_analysis(user_message)
-
-            result = response.json()
-            llm_response = result["choices"][0]["message"]["content"]
-
-            # Parse JSON response
-            intent = self._parse_llm_response(llm_response)
-
-            return intent
+            # Use hybrid router if enabled
+            if self.use_router and self.router:
+                return await self._analyze_with_router(user_message, conversation_history, current_params)
+            else:
+                return await self._analyze_legacy(user_message, conversation_history, current_params)
 
         except Exception as e:
             logger.error(f"Error analyzing intent: {e}", exc_info=True)
             return self._fallback_analysis(user_message)
+
+    async def _analyze_with_router(
+        self,
+        user_message: str,
+        conversation_history: List[Dict[str, str]],
+        current_params: Optional[GenerationParameters] = None
+    ) -> Intent:
+        """Analyze using hybrid Gemini + Qwen-VL router"""
+
+        # Build context for router
+        context_dict = {
+            "conversation_history": conversation_history[-5:] if conversation_history else [],
+            "current_params": current_params.to_dict() if current_params else None
+        }
+
+        # Route and analyze
+        result, decision = await self.router.analyze_with_routing(
+            message=user_message,
+            context=context_dict
+        )
+
+        logger.info(f"Routed to {decision.llm_type.value}: {decision.reason}")
+
+        # Convert to Intent object
+        return self._convert_router_result_to_intent(result)
+
+    def _convert_router_result_to_intent(self, result: Dict[str, Any]) -> Intent:
+        """Convert router result to Intent object"""
+
+        # Map intent_type string to IntentType enum
+        intent_type_map = {
+            "new_generation": IntentType.NEW_GENERATION,
+            "refine_previous": IntentType.REFINE_PREVIOUS,
+            "parameter_adjustment": IntentType.PARAMETER_ADJUSTMENT,
+            "style_change": IntentType.STYLE_CHANGE,
+            "train_lora": IntentType.TRAIN_LORA,
+            "style_lock": IntentType.STYLE_LOCK,
+            "style_unlock": IntentType.STYLE_UNLOCK,
+            "batch_generate": IntentType.BATCH_GENERATE,
+            "add_relationship": IntentType.ADD_RELATIONSHIP,
+            "multi_character_scene": IntentType.MULTI_CHARACTER_SCENE,
+            "character_create": IntentType.CHARACTER_CREATE,
+            "character_use": IntentType.CHARACTER_USE,
+            "character_sheet": IntentType.CHARACTER_SHEET
+        }
+
+        intent_type_str = result.get("intent_type", "new_generation")
+        intent_type = intent_type_map.get(intent_type_str, IntentType.NEW_GENERATION)
+
+        # Build adjustments dict
+        adjustments = result.get("adjustments", {})
+
+        # Map brightness/detail/color to parameter deltas
+        if adjustments.get("brightness") == "brighter":
+            adjustments["cfg_scale_delta"] = 2.0
+            adjustments["prompt_add"] = adjustments.get("prompt_add", []) + ["bright", "well-lit"]
+        elif adjustments.get("brightness") == "darker":
+            adjustments["cfg_scale_delta"] = -1.5
+            adjustments["prompt_add"] = adjustments.get("prompt_add", []) + ["dim lighting"]
+
+        if adjustments.get("detail") == "more":
+            adjustments["steps_delta"] = 10
+            adjustments["prompt_add"] = adjustments.get("prompt_add", []) + ["detailed", "intricate"]
+        elif adjustments.get("detail") == "less":
+            adjustments["steps_delta"] = -10
+            adjustments["prompt_add"] = adjustments.get("prompt_add", []) + ["simple", "minimalist"]
+
+        if adjustments.get("color") == "more":
+            adjustments["cfg_scale_delta"] = adjustments.get("cfg_scale_delta", 0) + 1.0
+            adjustments["prompt_add"] = adjustments.get("prompt_add", []) + ["colorful", "vibrant"]
+
+        # Build prompt modifications
+        prompt_modifications = {
+            "add": result.get("prompt_additions", []),
+            "remove": result.get("prompt_removals", []),
+            "emphasis": []
+        }
+
+        return Intent(
+            type=intent_type,
+            confidence=result.get("confidence", 0.8),
+            adjustments=adjustments,
+            explanation=result.get("explanation", ""),
+            prompt_modifications=prompt_modifications
+        )
+
+    async def _analyze_legacy(
+        self,
+        user_message: str,
+        conversation_history: List[Dict[str, str]],
+        current_params: Optional[GenerationParameters] = None
+    ) -> Intent:
+        """Legacy Qwen-only analysis (fallback)"""
+
+        # Build context
+        context = self._build_context(conversation_history, current_params)
+
+        # Call LLM
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": context + "\n\nUser request: " + user_message}
+        ]
+
+        response = await self.client.post(
+            f"{self.llm_base_url}/chat/completions",
+            json={
+                "model": "qwen2.5:latest",
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 500
+            }
+        )
+
+        if response.status_code != 200:
+            logger.error(f"LLM request failed: {response.status_code}")
+            return self._fallback_analysis(user_message)
+
+        result = response.json()
+        llm_response = result["choices"][0]["message"]["content"]
+
+        # Parse JSON response
+        intent = self._parse_llm_response(llm_response)
+
+        return intent
 
     def _build_context(
         self,

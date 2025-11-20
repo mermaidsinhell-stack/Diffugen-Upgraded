@@ -1566,6 +1566,32 @@ async def get_relationships(character_name: str):
 
 
 # ============================================================================
+# LLM Usage Statistics Endpoint
+# ============================================================================
+
+@app.get(
+    "/llm/usage-stats",
+    tags=["System"],
+    summary="Get LLM Usage Statistics"
+)
+async def get_llm_usage_stats():
+    """Get current LLM usage statistics (Gemini + Qwen-VL)"""
+    try:
+        if hasattr(intelligent_workflow.intent_analyzer, 'router') and intelligent_workflow.intent_analyzer.router:
+            stats = intelligent_workflow.intent_analyzer.router.get_usage_stats()
+            return stats
+        else:
+            return {
+                "error": "Hybrid routing not enabled",
+                "message": "Set USE_HYBRID_ROUTING=true in .env to enable usage tracking"
+            }
+
+    except Exception as e:
+        logger.error(f"Error getting LLM usage stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # Application Entry Point
 # ============================================================================
 
