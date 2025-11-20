@@ -47,6 +47,11 @@ from streaming import (
     ProgressPhase,
     sse_generator
 )
+from intelligent_workflow import (
+    IntelligentWorkflow,
+    GenerationParameters,
+    ConversationContext
+)
 
 
 # ============================================================================
@@ -961,6 +966,191 @@ async def generate_image_stream(
         raise
     except Exception as e:
         logger.error(f"Error in unified streaming generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Conversational / Intelligent Generation (Storybook Mode)
+# ============================================================================
+
+# Initialize intelligent workflow
+intelligent_workflow = IntelligentWorkflow(
+    diffugen_base_url="http://localhost:8080",  # Self-reference
+    llm_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+)
+
+
+class ConversationalRequest(BaseModel):
+    """Request for conversational generation"""
+    session_id: str = Field(..., description="Conversation session ID")
+    message: str = Field(..., description="User's natural language request")
+
+
+class ConversationalResponse(BaseModel):
+    """Response from conversational generation"""
+    success: bool
+    image_path: Optional[str] = None
+    image_url: Optional[str] = None
+    explanation: str
+    parameters: Optional[Dict[str, Any]] = None
+    adjustments_applied: Optional[Dict[str, Any]] = None
+    safety_warnings: Optional[List[str]] = None
+    intent: Optional[str] = None
+    error: Optional[str] = None
+
+
+@app.post(
+    "/conversational/generate",
+    response_model=ConversationalResponse,
+    tags=["Conversational Generation"],
+    summary="Conversational Image Generation for Storybooks"
+)
+async def conversational_generate(request: ConversationalRequest, req: Request):
+    """
+    Intelligent conversational image generation for children's storybooks.
+
+    Uses natural language to iteratively refine images with LLM-powered parameter tuning.
+
+    Examples:
+    - "Create a friendly dragon in a castle"
+    - "Make it brighter and more colorful"
+    - "Less detailed, more cartoon-like"
+    - "Make the dragon bigger"
+
+    The system:
+    - Analyzes your natural language request using Qwen LLM
+    - Intelligently adjusts parameters (steps, cfg_scale, etc.)
+    - Maintains conversation context for iterative refinement
+    - Ensures child-appropriate content
+    - Remembers what you liked/disliked
+    """
+    try:
+        # Process message through intelligent workflow
+        result = await intelligent_workflow.process_message(
+            session_id=request.session_id,
+            user_message=request.message
+        )
+
+        # Build image URL if path exists
+        if result.get("image_path") and not result.get("image_url"):
+            image_path = Path(result["image_path"])
+            result["image_url"] = build_image_url(
+                str(req.base_url),
+                image_path,
+                config['images']['serve_path']
+            )
+
+        return ConversationalResponse(**result)
+
+    except Exception as e:
+        logger.error(f"Error in conversational generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/conversational/session/{session_id}",
+    tags=["Conversational Generation"],
+    summary="Get Conversation Session"
+)
+async def get_conversation_session(session_id: str):
+    """
+    Get conversation session history and context
+    """
+    try:
+        session = intelligent_workflow.get_session(session_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return {
+            "session_id": session.session_id,
+            "created_at": session.created_at,
+            "message_count": len(session.messages),
+            "generation_count": len(session.generation_history),
+            "current_parameters": session.current_parameters.to_dict() if session.current_parameters else None,
+            "recent_messages": session.messages[-5:],  # Last 5 messages
+            "style_preferences": session.style_preferences,
+            "character_references": session.character_references
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/conversational/session",
+    tags=["Conversational Generation"],
+    summary="Create New Conversation Session"
+)
+async def create_conversation_session():
+    """
+    Create a new conversation session
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        context = intelligent_workflow.create_session(session_id)
+
+        return {
+            "session_id": session_id,
+            "created_at": context.created_at,
+            "message": "New conversation session created. Start by describing what you want to generate!"
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete(
+    "/conversational/session/{session_id}",
+    tags=["Conversational Generation"],
+    summary="Delete Conversation Session"
+)
+async def delete_conversation_session(session_id: str):
+    """
+    Delete a conversation session
+    """
+    try:
+        if session_id in intelligent_workflow.conversations:
+            del intelligent_workflow.conversations[session_id]
+            return {"success": True, "message": "Session deleted"}
+        else:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/conversational/sessions",
+    tags=["Conversational Generation"],
+    summary="List All Sessions"
+)
+async def list_conversation_sessions():
+    """
+    List all active conversation sessions
+    """
+    try:
+        sessions = []
+        for session_id, context in intelligent_workflow.conversations.items():
+            sessions.append({
+                "session_id": session_id,
+                "created_at": context.created_at,
+                "message_count": len(context.messages),
+                "generation_count": len(context.generation_history),
+                "last_activity": context.messages[-1]["timestamp"] if context.messages else context.created_at
+            })
+
+        return {"sessions": sessions, "total": len(sessions)}
+
+    except Exception as e:
+        logger.error(f"Error listing sessions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
