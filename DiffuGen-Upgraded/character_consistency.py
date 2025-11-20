@@ -39,6 +39,11 @@ class Character:
     # Generation parameters used
     parameters: Dict[str, Any] = field(default_factory=dict)
 
+    # LoRA model support for perfect consistency
+    lora_path: Optional[str] = None  # Path to trained LoRA model
+    lora_weight: float = 1.0  # LoRA weight (0.0-2.0)
+    has_lora: bool = False  # Whether LoRA is trained and available
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
         return asdict(self)
@@ -327,6 +332,136 @@ class CharacterConsistencyEngine:
         self.library.save_character(character)
 
         return results
+
+    async def train_character_lora(
+        self,
+        character: Character,
+        num_additional_images: int = 10,
+        epochs: int = 10,
+        progress_callback: Optional[callable] = None
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Train a LoRA model for perfect character consistency
+
+        Args:
+            character: Character to train LoRA for
+            num_additional_images: Number of additional training images to generate
+            epochs: Training epochs
+            progress_callback: Optional callback for progress updates
+
+        Returns:
+            (success, lora_path, error_message)
+        """
+        from lora_training import LoRATrainer, LoRATrainingConfig
+
+        logger.info(f"Training LoRA for character: {character.name}")
+
+        try:
+            # Initialize LoRA trainer
+            trainer = LoRATrainer()
+
+            # Collect all reference images
+            reference_images = [character.reference_image]
+            reference_images.extend(character.reference_images.values())
+
+            # Generate additional training images for variety
+            if num_additional_images > 0:
+                logger.info(f"Generating {num_additional_images} additional training images")
+                additional_images = await trainer.generate_additional_training_data(
+                    character_name=character.name,
+                    character_description=character.description,
+                    seed=character.seed,
+                    num_variations=num_additional_images,
+                    diffugen_base_url=self.diffugen_base_url
+                )
+                reference_images.extend(additional_images)
+
+            # Prepare training dataset
+            training_dir = await trainer.prepare_training_data(
+                character_name=character.name,
+                reference_images=reference_images,
+                character_description=character.description
+            )
+
+            # Create training configuration
+            config = LoRATrainingConfig(
+                character_name=character.name,
+                training_images_dir=training_dir,
+                output_dir=f"loras/{character.name}",
+                epochs=epochs,
+                base_model=character.parameters.get("model", "sd15"),
+                resolution=character.parameters.get("width", 512)
+            )
+
+            # Train LoRA
+            success, lora_path, error = await trainer.train_lora(config, progress_callback)
+
+            if success:
+                # Update character with LoRA information
+                character.lora_path = lora_path
+                character.has_lora = True
+                self.library.save_character(character)
+
+                logger.info(f"LoRA training complete for {character.name}: {lora_path}")
+                return True, lora_path, None
+            else:
+                logger.error(f"LoRA training failed for {character.name}: {error}")
+                return False, None, error
+
+        except Exception as e:
+            logger.error(f"Error training LoRA for {character.name}: {e}")
+            return False, None, str(e)
+
+    async def generate_with_lora(
+        self,
+        character: Character,
+        scene_description: str,
+        lora_weight: float = 1.0,
+        **generation_params
+    ) -> Dict[str, Any]:
+        """
+        Generate image using character's LoRA model for perfect consistency
+
+        Args:
+            character: Character with trained LoRA
+            scene_description: Description of the scene
+            lora_weight: LoRA weight (0.0-2.0, default 1.0)
+            **generation_params: Additional parameters
+
+        Returns:
+            Generation result
+        """
+        if not character.has_lora or not character.lora_path:
+            raise ValueError(f"Character {character.name} does not have a trained LoRA")
+
+        logger.info(f"Generating with LoRA for character: {character.name}")
+
+        # Build prompt with LoRA tag
+        from lora_training import create_lora_prompt_tag
+
+        lora_tag = create_lora_prompt_tag(character.name, lora_weight)
+        combined_prompt = f"{lora_tag} {character.description} {scene_description}, "
+        combined_prompt += "children's book illustration, cute, friendly, wholesome"
+
+        if character.style_notes:
+            combined_prompt += f", {character.style_notes}"
+
+        # Generate with LoRA
+        params = {
+            "prompt": combined_prompt,
+            "model": generation_params.get("model", character.parameters.get("model", "sd15")),
+            "width": generation_params.get("width", character.parameters.get("width", 512)),
+            "height": generation_params.get("height", character.parameters.get("height", 512)),
+            "steps": generation_params.get("steps", 25),
+            "cfg_scale": generation_params.get("cfg_scale", 7.5),
+            "seed": character.seed if generation_params.get("use_character_seed", True) else -1,
+            "sampling_method": generation_params.get("sampling_method", "euler_a"),
+            "negative_prompt": generation_params.get("negative_prompt", self._get_default_negative()),
+            "lora_model_dir": str(Path(character.lora_path).parent),
+        }
+
+        result = await self._generate_image(params)
+        return result
 
     def _build_character_prompt(self, description: str) -> str:
         """Build prompt for character generation"""

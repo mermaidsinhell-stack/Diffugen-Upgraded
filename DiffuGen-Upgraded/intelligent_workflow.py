@@ -19,6 +19,14 @@ from character_consistency import (
     Character,
     CharacterLibrary
 )
+from style_locking import StyleLockManager, StyleLibrary, ArtStyle
+from batch_generation import BatchGenerationManager, parse_batch_request
+from character_relationships import (
+    RelationshipGraph,
+    MultiCharacterSceneGenerator,
+    parse_relationship_request,
+    RelationType
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +44,12 @@ class IntentType(Enum):
     CHARACTER_CREATE = "character_create"
     CHARACTER_USE = "character_use"
     CHARACTER_SHEET = "character_sheet"
+    TRAIN_LORA = "train_lora"  # Train LoRA for character
+    STYLE_LOCK = "style_lock"  # Lock art style
+    STYLE_UNLOCK = "style_unlock"  # Unlock art style
+    BATCH_GENERATE = "batch_generate"  # Generate multiple scenes
+    ADD_RELATIONSHIP = "add_relationship"  # Add character relationship
+    MULTI_CHARACTER_SCENE = "multi_character_scene"  # Scene with multiple characters
     CLARIFICATION_NEEDED = "clarification_needed"
 
 
@@ -93,6 +107,8 @@ class ConversationContext:
     style_preferences: Dict[str, Any] = field(default_factory=dict)
     character_references: Dict[str, str] = field(default_factory=dict)  # name -> image_path
     active_character: Optional[str] = None  # Currently active character name
+    locked_style: Optional[str] = None  # Locked style name
+    active_batch_id: Optional[str] = None  # Current batch job ID
     created_at: float = field(default_factory=time.time)
 
 
@@ -506,6 +522,23 @@ class IntelligentWorkflow:
             diffugen_base_url=diffugen_base_url
         )
 
+        # Style management
+        self.style_manager = StyleLockManager()
+
+        # Batch generation
+        self.batch_manager = BatchGenerationManager(
+            character_engine=self.character_engine,
+            style_manager=self.style_manager,
+            max_concurrent=3
+        )
+
+        # Character relationships
+        self.relationship_graph = RelationshipGraph()
+        self.multi_char_generator = MultiCharacterSceneGenerator(
+            character_engine=self.character_engine,
+            relationship_graph=self.relationship_graph
+        )
+
         # Active conversations
         self.conversations: Dict[str, ConversationContext] = {}
 
@@ -585,6 +618,18 @@ class IntelligentWorkflow:
                 result = await self._handle_character_use(context, user_message, intent)
             elif intent.type == IntentType.CHARACTER_SHEET:
                 result = await self._handle_character_sheet(context, user_message, intent)
+            elif intent.type == IntentType.TRAIN_LORA:
+                result = await self._handle_train_lora(context, user_message, intent)
+            elif intent.type == IntentType.STYLE_LOCK:
+                result = await self._handle_style_lock(context, user_message, intent)
+            elif intent.type == IntentType.STYLE_UNLOCK:
+                result = await self._handle_style_unlock(context, user_message, intent)
+            elif intent.type == IntentType.BATCH_GENERATE:
+                result = await self._handle_batch_generate(context, user_message, intent)
+            elif intent.type == IntentType.ADD_RELATIONSHIP:
+                result = await self._handle_add_relationship(context, user_message, intent)
+            elif intent.type == IntentType.MULTI_CHARACTER_SCENE:
+                result = await self._handle_multi_character_scene(context, user_message, intent)
             else:
                 result = {
                     "success": False,
@@ -877,6 +922,293 @@ class IntelligentWorkflow:
             return {
                 "success": False,
                 "error": f"Failed to generate character sheet: {str(e)}"
+            }
+
+    async def _handle_train_lora(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle LoRA training request"""
+        try:
+            # Extract character name from message
+            character_name = context.active_character
+            if not character_name:
+                # Try to extract from message
+                name_match = re.search(r'(?:train|lora for)\s+([A-Za-z]+)', message, re.IGNORECASE)
+                if name_match:
+                    character_name = name_match.group(1).capitalize()
+                else:
+                    return {
+                        "success": False,
+                        "error": "Please specify which character to train LoRA for"
+                    }
+
+            # Get character
+            character = self.character_engine.library.get_character(character_name)
+            if not character:
+                return {
+                    "success": False,
+                    "error": f"Character '{character_name}' not found"
+                }
+
+            # Train LoRA
+            logger.info(f"Starting LoRA training for {character_name}")
+
+            success, lora_path, error = await self.character_engine.train_character_lora(
+                character=character,
+                num_additional_images=10,
+                epochs=10
+            )
+
+            if success:
+                return {
+                    "success": True,
+                    "explanation": f"Successfully trained LoRA for {character_name}. You can now use it for perfect character consistency!",
+                    "character_name": character_name,
+                    "lora_path": lora_path
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"LoRA training failed: {error}"
+                }
+
+        except Exception as e:
+            logger.error(f"Error training LoRA: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to train LoRA: {str(e)}"
+            }
+
+    async def _handle_style_lock(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle style locking request"""
+        try:
+            # Extract style name from message
+            style_match = re.search(
+                r'(?:lock|use|set)\s+(?:style\s+)?([a-z_]+)(?:\s+style)?',
+                message,
+                re.IGNORECASE
+            )
+
+            if style_match:
+                style_name = style_match.group(1).lower().replace(' ', '_')
+            else:
+                # Default to watercolor
+                style_name = "watercolor_soft"
+
+            # Lock style
+            success = self.style_manager.lock_style(context.session_id, style_name)
+
+            if success:
+                context.locked_style = style_name
+                style = self.style_manager.get_locked_style(context.session_id)
+
+                return {
+                    "success": True,
+                    "explanation": f"Locked art style to '{style.name}'. All future generations will use this consistent style.",
+                    "style_name": style.name,
+                    "style_description": style.description
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"Style '{style_name}' not found. Available styles: watercolor_soft, digital_vibrant, pencil_sketch, cartoon_bold, storybook_classic"
+                }
+
+        except Exception as e:
+            logger.error(f"Error locking style: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to lock style: {str(e)}"
+            }
+
+    async def _handle_style_unlock(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle style unlocking request"""
+        try:
+            self.style_manager.unlock_style(context.session_id)
+            context.locked_style = None
+
+            return {
+                "success": True,
+                "explanation": "Style lock removed. You can now use different styles or let me choose automatically."
+            }
+
+        except Exception as e:
+            logger.error(f"Error unlocking style: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to unlock style: {str(e)}"
+            }
+
+    async def _handle_batch_generate(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle batch scene generation request"""
+        try:
+            # Parse scene descriptions from message
+            scene_descriptions = parse_batch_request(message)
+
+            if not scene_descriptions:
+                return {
+                    "success": False,
+                    "error": "Could not parse scene descriptions. Try: 'Generate scenes: castle, forest, beach'"
+                }
+
+            # Create batch job
+            batch = await self.batch_manager.create_batch(
+                session_id=context.session_id,
+                scene_descriptions=scene_descriptions,
+                character_name=context.active_character,
+                style_name=context.locked_style,
+                use_lora=True  # Use LoRA if available
+            )
+
+            context.active_batch_id = batch.batch_id
+
+            # Start execution in background
+            asyncio.create_task(self.batch_manager.execute_batch(batch.batch_id))
+
+            return {
+                "success": True,
+                "explanation": f"Started batch generation of {len(scene_descriptions)} scenes. Batch ID: {batch.batch_id}",
+                "batch_id": batch.batch_id,
+                "total_scenes": batch.total_scenes,
+                "scene_descriptions": scene_descriptions
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating batch: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to create batch: {str(e)}"
+            }
+
+    async def _handle_add_relationship(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle adding character relationship"""
+        try:
+            # Parse relationship from message
+            relationship_data = parse_relationship_request(message)
+
+            if not relationship_data:
+                return {
+                    "success": False,
+                    "error": "Could not parse relationship. Try: 'Spark's friend is Whiskers'"
+                }
+
+            char_a, char_b, rel_type_str = relationship_data
+
+            # Convert string to RelationType
+            rel_type_map = {
+                "friend": RelationType.FRIEND,
+                "sibling": RelationType.SIBLING,
+                "companion": RelationType.COMPANION,
+                "rival": RelationType.RIVAL,
+                "mentor": RelationType.MENTOR,
+                "student": RelationType.STUDENT,
+                "teammate": RelationType.TEAMMATE,
+            }
+
+            rel_type = rel_type_map.get(rel_type_str, RelationType.FRIEND)
+
+            # Add relationship
+            relationship = self.relationship_graph.add_relationship(
+                character_a=char_a,
+                character_b=char_b,
+                relationship_type=rel_type
+            )
+
+            return {
+                "success": True,
+                "explanation": f"Added relationship: {relationship.get_relationship_description()}",
+                "character_a": char_a,
+                "character_b": char_b,
+                "relationship_type": rel_type.value
+            }
+
+        except Exception as e:
+            logger.error(f"Error adding relationship: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to add relationship: {str(e)}"
+            }
+
+    async def _handle_multi_character_scene(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle multi-character scene generation"""
+        try:
+            # Extract character names from message
+            # Simple approach: look for character names in message
+            characters = []
+
+            # Check for "with" pattern: "Spark with Whiskers"
+            with_match = re.search(r'([A-Za-z]+)\s+with\s+([A-Za-z]+)', message, re.IGNORECASE)
+            if with_match:
+                characters = [
+                    with_match.group(1).capitalize(),
+                    with_match.group(2).capitalize()
+                ]
+
+            # Check for "and" pattern: "Spark and Whiskers"
+            elif re.search(r'([A-Za-z]+)\s+and\s+([A-Za-z]+)', message, re.IGNORECASE):
+                and_match = re.findall(r'\b([A-Z][a-z]+)\b', message)
+                characters = and_match[:3]  # Limit to 3 characters
+
+            if len(characters) < 2:
+                return {
+                    "success": False,
+                    "error": "Please specify at least 2 characters for a multi-character scene"
+                }
+
+            # Extract scene description (remove character names)
+            scene_description = message
+            for char in characters:
+                scene_description = scene_description.replace(char, "")
+            scene_description = scene_description.replace("with", "").replace("and", "")
+            scene_description = scene_description.strip()
+
+            # Generate multi-character scene
+            result = await self.multi_char_generator.generate_multi_character_scene(
+                characters=characters,
+                scene_description=scene_description
+            )
+
+            return {
+                "success": result.get("success", False),
+                "image_path": result.get("image_path"),
+                "image_url": result.get("image_url"),
+                "explanation": f"Generated scene with {', '.join(characters)}",
+                "characters": characters
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating multi-character scene: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to generate multi-character scene: {str(e)}"
             }
 
     def _apply_adjustments(

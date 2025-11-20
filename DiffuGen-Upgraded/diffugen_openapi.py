@@ -1155,6 +1155,417 @@ async def list_conversation_sessions():
 
 
 # ============================================================================
+# LoRA Training Endpoints
+# ============================================================================
+
+@app.post(
+    "/character/train-lora",
+    tags=["Character Management"],
+    summary="Train LoRA for Character"
+)
+async def train_character_lora(request: Request):
+    """
+    Train a LoRA model for perfect character consistency
+
+    Request body:
+    {
+        "character_name": "Spark",
+        "num_additional_images": 10,
+        "epochs": 10
+    }
+    """
+    try:
+        data = await request.json()
+        character_name = data.get("character_name")
+
+        if not character_name:
+            raise HTTPException(status_code=400, detail="character_name is required")
+
+        # Get character
+        character = intelligent_workflow.character_engine.library.get_character(character_name)
+        if not character:
+            raise HTTPException(status_code=404, detail=f"Character '{character_name}' not found")
+
+        # Train LoRA
+        success, lora_path, error = await intelligent_workflow.character_engine.train_character_lora(
+            character=character,
+            num_additional_images=data.get("num_additional_images", 10),
+            epochs=data.get("epochs", 10)
+        )
+
+        if success:
+            return {
+                "success": True,
+                "character_name": character_name,
+                "lora_path": lora_path,
+                "message": f"LoRA training complete for {character_name}"
+            }
+        else:
+            raise HTTPException(status_code=500, detail=error or "LoRA training failed")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error training LoRA: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/character/{character_name}/lora-status",
+    tags=["Character Management"],
+    summary="Get LoRA Training Status"
+)
+async def get_lora_status(character_name: str):
+    """Get LoRA training status for a character"""
+    try:
+        character = intelligent_workflow.character_engine.library.get_character(character_name)
+        if not character:
+            raise HTTPException(status_code=404, detail=f"Character '{character_name}' not found")
+
+        return {
+            "character_name": character_name,
+            "has_lora": character.has_lora,
+            "lora_path": character.lora_path,
+            "lora_weight": character.lora_weight
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting LoRA status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Style Locking Endpoints
+# ============================================================================
+
+@app.post(
+    "/style/lock",
+    tags=["Style Management"],
+    summary="Lock Art Style"
+)
+async def lock_style(request: Request):
+    """
+    Lock an art style for a session
+
+    Request body:
+    {
+        "session_id": "session-123",
+        "style_name": "watercolor_soft"
+    }
+    """
+    try:
+        data = await request.json()
+        session_id = data.get("session_id")
+        style_name = data.get("style_name")
+
+        if not session_id or not style_name:
+            raise HTTPException(status_code=400, detail="session_id and style_name are required")
+
+        # Lock style
+        success = intelligent_workflow.style_manager.lock_style(session_id, style_name)
+
+        if success:
+            # Update session context
+            if session_id in intelligent_workflow.conversations:
+                intelligent_workflow.conversations[session_id].locked_style = style_name
+
+            style = intelligent_workflow.style_manager.get_locked_style(session_id)
+            return {
+                "success": True,
+                "style_name": style.name,
+                "style_description": style.description,
+                "message": f"Locked style to '{style.name}'"
+            }
+        else:
+            available_styles = list(intelligent_workflow.style_manager.library.styles.keys())
+            raise HTTPException(
+                status_code=404,
+                detail=f"Style '{style_name}' not found. Available: {', '.join(available_styles)}"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error locking style: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/style/unlock",
+    tags=["Style Management"],
+    summary="Unlock Art Style"
+)
+async def unlock_style(request: Request):
+    """
+    Unlock art style for a session
+
+    Request body:
+    {
+        "session_id": "session-123"
+    }
+    """
+    try:
+        data = await request.json()
+        session_id = data.get("session_id")
+
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+
+        # Unlock style
+        intelligent_workflow.style_manager.unlock_style(session_id)
+
+        # Update session context
+        if session_id in intelligent_workflow.conversations:
+            intelligent_workflow.conversations[session_id].locked_style = None
+
+        return {
+            "success": True,
+            "message": "Style lock removed"
+        }
+
+    except Exception as e:
+        logger.error(f"Error unlocking style: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/style/list",
+    tags=["Style Management"],
+    summary="List Available Styles"
+)
+async def list_styles():
+    """List all available art styles"""
+    try:
+        styles = intelligent_workflow.style_manager.library.list_styles()
+
+        return {
+            "styles": [
+                {
+                    "name": style.name,
+                    "description": style.description,
+                    "technique": style.technique,
+                    "color_palette": style.color_palette,
+                    "mood": style.mood
+                }
+                for style in styles
+            ],
+            "total": len(styles)
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing styles: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Batch Generation Endpoints
+# ============================================================================
+
+@app.post(
+    "/batch/create",
+    tags=["Batch Generation"],
+    summary="Create Batch Generation Job"
+)
+async def create_batch(request: Request):
+    """
+    Create a batch generation job
+
+    Request body:
+    {
+        "session_id": "session-123",
+        "scene_descriptions": ["castle", "forest", "beach"],
+        "character_name": "Spark",
+        "style_name": "watercolor_soft",
+        "use_lora": true
+    }
+    """
+    try:
+        data = await request.json()
+        session_id = data.get("session_id")
+        scene_descriptions = data.get("scene_descriptions", [])
+
+        if not session_id or not scene_descriptions:
+            raise HTTPException(status_code=400, detail="session_id and scene_descriptions are required")
+
+        # Create batch
+        batch = await intelligent_workflow.batch_manager.create_batch(
+            session_id=session_id,
+            scene_descriptions=scene_descriptions,
+            character_name=data.get("character_name"),
+            style_name=data.get("style_name"),
+            use_lora=data.get("use_lora", False)
+        )
+
+        # Update session context
+        if session_id in intelligent_workflow.conversations:
+            intelligent_workflow.conversations[session_id].active_batch_id = batch.batch_id
+
+        # Start execution
+        asyncio.create_task(intelligent_workflow.batch_manager.execute_batch(batch.batch_id))
+
+        return {
+            "success": True,
+            "batch_id": batch.batch_id,
+            "total_scenes": batch.total_scenes,
+            "message": f"Started batch generation of {batch.total_scenes} scenes"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating batch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/batch/{batch_id}/status",
+    tags=["Batch Generation"],
+    summary="Get Batch Status"
+)
+async def get_batch_status(batch_id: str):
+    """Get status of a batch generation job"""
+    try:
+        batch = intelligent_workflow.batch_manager.get_batch(batch_id)
+
+        if not batch:
+            raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
+
+        return batch.to_dict()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting batch status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/batch/{batch_id}/cancel",
+    tags=["Batch Generation"],
+    summary="Cancel Batch Job"
+)
+async def cancel_batch(batch_id: str):
+    """Cancel a batch generation job"""
+    try:
+        success = intelligent_workflow.batch_manager.cancel_batch(batch_id)
+
+        if success:
+            return {
+                "success": True,
+                "message": f"Batch {batch_id} cancelled"
+            }
+        else:
+            raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling batch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Character Relationship Endpoints
+# ============================================================================
+
+@app.post(
+    "/relationship/add",
+    tags=["Character Relationships"],
+    summary="Add Character Relationship"
+)
+async def add_relationship(request: Request):
+    """
+    Add a relationship between two characters
+
+    Request body:
+    {
+        "character_a": "Spark",
+        "character_b": "Whiskers",
+        "relationship_type": "friend",
+        "description": "best friends"
+    }
+    """
+    try:
+        from character_relationships import RelationType
+
+        data = await request.json()
+        char_a = data.get("character_a")
+        char_b = data.get("character_b")
+        rel_type_str = data.get("relationship_type", "friend")
+
+        if not char_a or not char_b:
+            raise HTTPException(status_code=400, detail="character_a and character_b are required")
+
+        # Map string to RelationType
+        rel_type_map = {
+            "friend": RelationType.FRIEND,
+            "sibling": RelationType.SIBLING,
+            "companion": RelationType.COMPANION,
+            "rival": RelationType.RIVAL,
+            "mentor": RelationType.MENTOR,
+            "student": RelationType.STUDENT,
+            "teammate": RelationType.TEAMMATE,
+            "family": RelationType.FAMILY,
+            "parent": RelationType.PARENT,
+            "child": RelationType.CHILD
+        }
+
+        rel_type = rel_type_map.get(rel_type_str.lower(), RelationType.FRIEND)
+
+        # Add relationship
+        relationship = intelligent_workflow.relationship_graph.add_relationship(
+            character_a=char_a,
+            character_b=char_b,
+            relationship_type=rel_type,
+            description=data.get("description", "")
+        )
+
+        return {
+            "success": True,
+            "character_a": char_a,
+            "character_b": char_b,
+            "relationship_type": rel_type.value,
+            "message": relationship.get_relationship_description()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding relationship: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/relationship/{character_name}",
+    tags=["Character Relationships"],
+    summary="Get Character Relationships"
+)
+async def get_relationships(character_name: str):
+    """Get all relationships for a character"""
+    try:
+        relationships = intelligent_workflow.relationship_graph.get_relationships(character_name)
+
+        return {
+            "character_name": character_name,
+            "relationships": [
+                {
+                    "related_character": rel.character_b,
+                    "relationship_type": rel.relationship_type.value,
+                    "description": rel.get_relationship_description()
+                }
+                for rel in relationships
+            ],
+            "total": len(relationships)
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting relationships: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # Application Entry Point
 # ============================================================================
 
