@@ -1,0 +1,18 @@
+# DiffuGen Storybook Enhancement Requirements
+
+# Core dependencies (likely already installed)
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+
+# HTTP client for async requests
+httpx>=0.25.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Gemini API integration
+google-generativeai>=0.3.0
+
+# Optional: for better JSON handling
+orjson>=3.9.0

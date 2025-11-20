@@ -502,23 +502,29 @@ def parse_relationship_request(message: str) -> Optional[Tuple[str, str, str]]:
     import re
 
     # Pattern 1: "X's RELATIONSHIP is Y"
-    pattern1 = r"([A-Za-z]+)'s\s+(friend|sibling|companion|rival|mentor|student)\s+is\s+([A-Za-z]+)"
+    pattern1 = r"([A-Za-z]+)'s\s+(friend|sibling|sister|brother|companion|rival|mentor|student)\s+is\s+([A-Za-z]+)"
     match = re.search(pattern1, message, re.IGNORECASE)
 
     if match:
         char_a = match.group(1).capitalize()
         rel_type = match.group(2).lower()
         char_b = match.group(3).capitalize()
+        # Normalize sister/brother to sibling
+        if rel_type in ["sister", "brother"]:
+            rel_type = "sibling"
         return (char_a, char_b, rel_type)
 
     # Pattern 2: "X is Y's RELATIONSHIP"
-    pattern2 = r"([A-Za-z]+)\s+is\s+([A-Za-z]+)'s\s+(friend|sibling|companion|rival|mentor|student)"
+    pattern2 = r"([A-Za-z]+)\s+is\s+([A-Za-z]+)'s\s+(friend|sibling|sister|brother|companion|rival|mentor|student)"
     match = re.search(pattern2, message, re.IGNORECASE)
 
     if match:
         char_a = match.group(1).capitalize()
         char_b = match.group(2).capitalize()
         rel_type = match.group(3).lower()
+        # Normalize sister/brother to sibling
+        if rel_type in ["sister", "brother"]:
+            rel_type = "sibling"
         return (char_a, char_b, rel_type)
 
     # Pattern 3: "Make X and Y RELATIONSHIP"

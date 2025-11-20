@@ -6,7 +6,7 @@ Ensures all illustrations maintain the same visual aesthetic
 import json
 import logging
 import time
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
