@@ -1,0 +1,152 @@
+version: '3.8'
+
+services:
+  # Ollama LLM Server (Qwen3-8B)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: diffugen-ollama
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # DiffuGen MCP Server (Existing - with updates)
+  diffugen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: diffugen:latest
+    container_name: diffugen-mcp
+    runtime: nvidia
+    command: ["/app/diffugen_env/bin/python", "diffugen_openapi.py"]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0
+      - SD_CPP_PATH=/app/stable-diffusion.cpp
+      - DIFFUGEN_OUTPUT_DIR=/app/outputs
+      - default_model=sd15
+    volumes:
+      # Persistent storage for models
+      - diffugen_models:/app/stable-diffusion.cpp/models
+      # Generated images
+      - ./outputs:/app/outputs
+      # Input images
+      - ./inputs:/app/inputs
+      # LoRA models
+      - diffugen_loras:/app/loras
+      # Source code (for development)
+      - ./diffugen.py:/app/diffugen.py:ro
+      - ./diffugen_openapi.py:/app/diffugen_openapi.py:ro
+      - ./diffugen.json:/app/diffugen.json:ro
+      - ./openapi_config.json:/app/openapi_config.json:ro
+      - ./character_manager.py:/app/character_manager.py:ro
+      - ./adetailer.py:/app/adetailer.py:ro
+      - ./preprocessor.py:/app/preprocessor.py:ro
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # LangGraph Orchestrator (NEW - The Brain)
+  langgraph:
+    build:
+      context: .
+      dockerfile: Dockerfile.langgraph
+    container_name: diffugen-langgraph
+    environment:
+      - VLLM_API_BASE=http://ollama:11434/v1
+      - DIFFUGEN_MCP_BASE=http://diffugen-mcp:8080
+      - VLLM_API_KEY=EMPTY
+      - ENABLE_VRAM_ORCHESTRATION=true
+      - ENABLE_SELF_HEALING=true
+      - MAX_RETRIES=3
+    volumes:
+      - ./langgraph_agent:/app
+      - ./outputs:/outputs:ro  # Read-only access to check generated images
+    ports:
+      - "8000:8000"  # API endpoint for the agent
+    depends_on:
+      ollama:
+        condition: service_healthy
+      diffugen:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Open WebUI - Chat Interface
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: diffugen-webui
+    ports:
+      - "3000:8080"
+    volumes:
+      - open-webui:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URLS=http://ollama:11434
+      - WEBUI_NAME=DiffuGen Chat
+      - ENABLE_IMAGE_GENERATION=true
+      - IMAGE_GENERATION_ENGINE=openai
+      - OPENAI_API_BASE_URL=http://langgraph:8000
+      - OPENAI_API_KEY=EMPTY
+    depends_on:
+      - ollama
+      - langgraph
+    restart: unless-stopped
+
+volumes:
+  # Ollama models
+  ollama_models:
+    driver: local
+
+  # DiffuGen models
+  diffugen_models:
+    driver: local
+
+  # DiffuGen LoRAs
+  diffugen_loras:
+    driver: local
+
+  # Open WebUI data
+  open-webui:
+    driver: local
+
+networks:
+  default:
+    name: diffugen-agentic-network
+    driver: bridge
+
+# Usage:
+# 1. Start core services: docker-compose -f docker-compose-agentic.yml up -d
+# 2. Start with Ollama management: docker-compose -f docker-compose-agentic.yml --profile management up -d
+# 3. Check logs: docker-compose -f docker-compose-agentic.yml logs -f langgraph
+# 4. Access agent API: curl http://localhost:8000/health
