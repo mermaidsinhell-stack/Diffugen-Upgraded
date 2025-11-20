@@ -225,7 +225,7 @@ Respond in JSON format:
 
         state["messages"] = messages + [response]
 
-        logger.info(f"Analysis complete: needs_refinement={{state['needs_refinement']}}")
+        logger.info(f"Analysis complete: needs_refinement={state['needs_refinement']}")
 
         return state
 
