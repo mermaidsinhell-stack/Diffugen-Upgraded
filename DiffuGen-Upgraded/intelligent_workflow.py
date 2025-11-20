@@ -14,6 +14,12 @@ from enum import Enum
 from pathlib import Path
 import httpx
 
+from character_consistency import (
+    CharacterConsistencyEngine,
+    Character,
+    CharacterLibrary
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,7 +33,9 @@ class IntentType(Enum):
     REFINE_PREVIOUS = "refine_previous"
     PARAMETER_ADJUSTMENT = "parameter_adjustment"
     STYLE_CHANGE = "style_change"
-    CHARACTER_CONSISTENCY = "character_consistency"
+    CHARACTER_CREATE = "character_create"
+    CHARACTER_USE = "character_use"
+    CHARACTER_SHEET = "character_sheet"
     CLARIFICATION_NEEDED = "clarification_needed"
 
 
@@ -84,6 +92,7 @@ class ConversationContext:
     current_parameters: Optional[GenerationParameters] = None
     style_preferences: Dict[str, Any] = field(default_factory=dict)
     character_references: Dict[str, str] = field(default_factory=dict)  # name -> image_path
+    active_character: Optional[str] = None  # Currently active character name
     created_at: float = field(default_factory=time.time)
 
 
@@ -492,6 +501,11 @@ class IntelligentWorkflow:
         self.intent_analyzer = IntentAnalyzer(llm_base_url)
         self.client = httpx.AsyncClient(timeout=300.0)
 
+        # Character consistency engine
+        self.character_engine = CharacterConsistencyEngine(
+            diffugen_base_url=diffugen_base_url
+        )
+
         # Active conversations
         self.conversations: Dict[str, ConversationContext] = {}
 
@@ -565,6 +579,12 @@ class IntelligentWorkflow:
                 result = await self._handle_refinement(context, user_message, intent)
             elif intent.type == IntentType.STYLE_CHANGE:
                 result = await self._handle_style_change(context, user_message, intent)
+            elif intent.type == IntentType.CHARACTER_CREATE:
+                result = await self._handle_character_create(context, user_message, intent)
+            elif intent.type == IntentType.CHARACTER_USE:
+                result = await self._handle_character_use(context, user_message, intent)
+            elif intent.type == IntentType.CHARACTER_SHEET:
+                result = await self._handle_character_sheet(context, user_message, intent)
             else:
                 result = {
                     "success": False,
@@ -693,6 +713,172 @@ class IntelligentWorkflow:
         # Similar to refinement but focuses on style
         return await self._handle_refinement(context, message, intent)
 
+    async def _handle_character_create(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle character creation request"""
+        logger.info("Handling character creation")
+
+        # Extract character name and description
+        # Simple parsing - look for patterns like "Create [name]" or "character named [name]"
+        name_match = re.search(r'(?:named?|called)\s+([A-Za-z]+)', message, re.IGNORECASE)
+        if name_match:
+            character_name = name_match.group(1).capitalize()
+        else:
+            # Use first word after "create/make"
+            create_match = re.search(r'(?:create|make)\s+(?:a\s+)?(.+?)(?:\s+named|\s+called|$)', message, re.IGNORECASE)
+            if create_match:
+                character_name = create_match.group(1).strip().split()[0].capitalize()
+            else:
+                character_name = f"Character_{int(time.time())}"
+
+        # Use full message as description
+        description = message
+
+        # Apply child safety filter
+        safe_description, warnings = ChildSafetyFilter.filter_prompt(description)
+
+        try:
+            # Create character
+            character, result = await self.character_engine.create_character(
+                name=character_name,
+                description=safe_description,
+                tags=["storybook", "custom"]
+            )
+
+            # Store in context
+            context.character_references[character_name] = character.reference_image
+            context.active_character = character_name
+
+            return {
+                "success": True,
+                "image_path": character.reference_image,
+                "image_url": result.get("image_url"),
+                "explanation": f"Created character '{character_name}': {safe_description[:100]}...",
+                "character_name": character_name,
+                "character_seed": character.seed,
+                "safety_warnings": warnings,
+                "parameters": character.parameters
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating character: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to create character: {str(e)}"
+            }
+
+    async def _handle_character_use(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle using existing character in new scene"""
+        logger.info("Handling character use in scene")
+
+        # Get active character
+        if not context.active_character:
+            # Try to find character name in message
+            for char_name in context.character_references.keys():
+                if char_name.lower() in message.lower():
+                    context.active_character = char_name
+                    break
+
+        if not context.active_character:
+            return {
+                "success": False,
+                "error": "No active character. Please create a character first or specify which character to use."
+            }
+
+        # Get character from library
+        character = self.character_engine.library.get_character(context.active_character)
+
+        if not character:
+            return {
+                "success": False,
+                "error": f"Character '{context.active_character}' not found in library."
+            }
+
+        # Extract scene description
+        scene_description = message
+
+        try:
+            # Generate with character
+            result = await self.character_engine.generate_with_character(
+                character=character,
+                scene_description=scene_description,
+                consistency_strength=0.75  # High consistency
+            )
+
+            return {
+                "success": result.get("success", False),
+                "image_path": result.get("image_path"),
+                "image_url": result.get("image_url"),
+                "explanation": f"Generated scene with {character.name}: {scene_description[:100]}...",
+                "character_name": character.name,
+                "parameters": result.get("parameters"),
+                "error": result.get("error")
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating with character: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to generate scene: {str(e)}"
+            }
+
+    async def _handle_character_sheet(
+        self,
+        context: ConversationContext,
+        message: str,
+        intent: Intent
+    ) -> Dict[str, Any]:
+        """Handle character sheet generation request"""
+        logger.info("Handling character sheet generation")
+
+        # Get active character
+        if not context.active_character:
+            return {
+                "success": False,
+                "error": "No active character. Please create a character first."
+            }
+
+        # Get character from library
+        character = self.character_engine.library.get_character(context.active_character)
+
+        if not character:
+            return {
+                "success": False,
+                "error": f"Character '{context.active_character}' not found in library."
+            }
+
+        try:
+            # Generate character sheet
+            poses = ["front view", "side view", "back view", "three-quarter view"]
+            sheet_results = await self.character_engine.generate_character_sheet(
+                character=character,
+                poses=poses
+            )
+
+            return {
+                "success": True,
+                "explanation": f"Generated character sheet for {character.name} with {len(sheet_results)} poses",
+                "character_name": character.name,
+                "character_sheet": sheet_results,
+                "poses_generated": list(sheet_results.keys())
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating character sheet: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to generate character sheet: {str(e)}"
+            }
+
     def _apply_adjustments(
         self,
         params: GenerationParameters,
@@ -784,6 +970,7 @@ class IntelligentWorkflow:
     async def close(self):
         """Cleanup resources"""
         await self.intent_analyzer.close()
+        await self.character_engine.close()
         await self.client.aclose()
 
 
