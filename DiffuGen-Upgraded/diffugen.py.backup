@@ -19,20 +19,6 @@ from character_manager import CharacterManager
 from adetailer import Adetailer
 from preprocessor import Preprocessor
 
-# Import core helper functions
-from diffugen_core import (
-    resolve_local_file_path as _get_local_file_path,
-    save_base64_image as _save_base64_image,
-    encode_image_to_base64 as _encode_image_to_base64,
-    handle_image_input as _handle_image_input,
-    validate_and_correct_loras,
-    build_base_command,
-    add_supporting_files,
-    apply_hires_fix,
-    sanitize_prompt as _sanitize_prompt,
-    create_output_filename
-)
-
 # Simplified logging setup - log only essential info
 logging.basicConfig(
     filename='diffugen_debug.log',
@@ -137,7 +123,236 @@ if mcp is None:
     sys.exit(1)
 
 # Function to load configuration
-# Base64 and file handling functions now imported from diffugen_core
+def _get_local_file_path(file_reference: str) -> str:
+    """Smart file path resolution for images.
+
+    Handles cases where LM Studio or other clients provide paths that don't exist
+    in the Docker container. Searches multiple locations and falls back to filename matching.
+
+    Args:
+        file_reference: Path or filename to resolve
+
+    Returns:
+        Resolved absolute path, or None if not found
+    """
+    if not file_reference:
+        return None
+
+    # If the exact path exists, return it immediately
+    if os.path.exists(file_reference):
+        return os.path.abspath(file_reference)
+
+    # Extract just the filename from the reference
+    filename = os.path.basename(file_reference)
+
+    # Search directories in priority order
+    search_dirs = [
+        '/app/inputs',      # Primary location for uploaded images
+        '/app/outputs',     # Previously generated images
+        '/app',             # Current working directory in Docker
+        os.getcwd(),        # Fallback to actual cwd
+    ]
+
+    # Search for exact filename match
+    for search_dir in search_dirs:
+        if not os.path.exists(search_dir):
+            continue
+
+        candidate_path = os.path.join(search_dir, filename)
+        if os.path.exists(candidate_path):
+            logging.info(f"Found image at: {candidate_path}")
+            return os.path.abspath(candidate_path)
+
+    # If no exact match, try fuzzy matching (in case of encoding issues with special chars)
+    for search_dir in search_dirs:
+        if not os.path.exists(search_dir):
+            continue
+
+        try:
+            for file in os.listdir(search_dir):
+                # Skip hidden files and non-image files
+                if file.startswith('.'):
+                    continue
+                if not file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp')):
+                    continue
+
+                # Check if filenames are similar (handles encoding issues)
+                if file.lower() == filename.lower():
+                    candidate_path = os.path.join(search_dir, file)
+                    logging.info(f"Found image with case-insensitive match: {candidate_path}")
+                    return os.path.abspath(candidate_path)
+        except Exception as e:
+            logging.warning(f"Error searching directory {search_dir}: {e}")
+            continue
+
+    # Last resort: return the most recent image file in /app/inputs if no filename provided
+    # or if we couldn't find a match (useful for "use the latest uploaded image" workflows)
+    if file_reference.lower() in ['latest', 'last', 'recent'] or '/' not in file_reference:
+        for search_dir in ['/app/inputs', '/app/outputs']:
+            if not os.path.exists(search_dir):
+                continue
+
+            try:
+                image_files = [
+                    os.path.join(search_dir, f) for f in os.listdir(search_dir)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp'))
+                    and not f.startswith('.')
+                ]
+
+                if image_files:
+                    # Sort by modification time, most recent first
+                    most_recent = max(image_files, key=os.path.getmtime)
+                    logging.info(f"Using most recent image: {most_recent}")
+                    return os.path.abspath(most_recent)
+            except Exception as e:
+                logging.warning(f"Error finding recent images in {search_dir}: {e}")
+                continue
+
+    # Could not resolve the file reference
+    logging.warning(f"Could not resolve file reference: {file_reference}")
+    return None
+
+def _save_base64_image(base64_data: str, prefix: str = "input") -> str:
+    """Save a base64 encoded image to a temporary file.
+
+    Args:
+        base64_data: Base64 encoded image string (with or without data URI prefix)
+        prefix: Prefix for the temp filename
+
+    Returns:
+        Absolute path to the saved temporary file
+    """
+    try:
+        if not base64_data:
+            raise ValueError("Empty base64 data provided")
+
+        original_data = base64_data
+
+        # Remove data URI prefix if present (e.g., "data:image/png;base64,")
+        if ',' in base64_data:
+            if base64_data.startswith('data:'):
+                base64_data = base64_data.split(',', 1)[1]
+            elif 'base64,' in base64_data:
+                # Handle cases where it might be malformed
+                base64_data = base64_data.split('base64,', 1)[1]
+
+        # Strip whitespace, newlines, and any other non-base64 characters
+        base64_data = base64_data.strip()
+        base64_data = base64_data.replace('\n', '').replace('\r', '').replace(' ', '')
+
+        # Validate base64 string (basic check)
+        if not base64_data or len(base64_data) < 100:
+            # Check if it's a common placeholder
+            if base64_data in ["base64_encoded_image_data", "BASE64_DATA_HERE", "base64_data", "..."]:
+                raise ValueError(
+                    f"Received placeholder '{base64_data}' instead of actual base64 image data. "
+                    "Your LM client doesn't support automatic image encoding yet. "
+                    "Please use init_image_path instead by saving your image to the inputs/ folder."
+                )
+            raise ValueError(f"Base64 string too short or invalid (length: {len(base64_data)})")
+
+        # Try to detect image format from base64 header BEFORE decoding
+        ext = '.png'  # default
+        if base64_data.startswith('/9j/'):
+            ext = '.jpg'
+        elif base64_data.startswith('iVBORw'):
+            ext = '.png'
+        elif base64_data.startswith('UklGR'):
+            ext = '.webp'
+        elif base64_data.startswith('Qk'):
+            ext = '.bmp'
+
+        # Decode base64 data with validation
+        try:
+            image_data = base64.b64decode(base64_data, validate=True)
+        except Exception as decode_error:
+            # Try without strict validation
+            logging.warning(f"Strict base64 decode failed, trying lenient decode: {decode_error}")
+            try:
+                image_data = base64.b64decode(base64_data, validate=False)
+            except Exception as e2:
+                raise ValueError(f"Base64 decode failed even with lenient mode. Data starts with: {base64_data[:50]}...")
+
+        # Verify we got actual image data
+        if not image_data or len(image_data) < 100:
+            raise ValueError(f"Decoded image data is too small ({len(image_data)} bytes), likely not a valid image")
+
+        # Create temporary file in /app/inputs (so it's accessible and cleanable)
+        temp_dir = '/app/inputs' if os.path.exists('/app/inputs') else tempfile.gettempdir()
+
+        # Create temp file
+        temp_file = os.path.join(temp_dir, f"{prefix}_{uuid.uuid4().hex}{ext}")
+
+        with open(temp_file, 'wb') as f:
+            f.write(image_data)
+
+        # Verify file was created and has content
+        if not os.path.exists(temp_file) or os.path.getsize(temp_file) < 100:
+            raise ValueError(f"Failed to write image file or file is too small")
+
+        logging.info(f"Saved base64 image to: {temp_file} ({len(image_data)} bytes, format: {ext})")
+        return temp_file
+
+    except ValueError as ve:
+        # Re-raise ValueError with context
+        logging.error(f"Base64 image validation error: {ve}")
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error saving base64 image: {e}")
+        logging.error(f"Base64 data length: {len(base64_data) if base64_data else 0}")
+        if base64_data:
+            logging.error(f"Base64 data starts with: {base64_data[:100]}...")
+        raise ValueError(f"Failed to decode and save base64 image: {str(e)}")
+
+def _encode_image_to_base64(image_path: str) -> str:
+    """Encode an image file to base64 string.
+
+    Args:
+        image_path: Path to the image file
+
+    Returns:
+        Base64 encoded string of the image
+    """
+    try:
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+
+        # Add data URI prefix based on file extension
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_type = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.webp': 'image/webp',
+            '.bmp': 'image/bmp'
+        }.get(ext, 'image/png')
+
+        return f"data:{mime_type};base64,{base64_data}"
+
+    except Exception as e:
+        logging.error(f"Error encoding image to base64: {e}")
+        raise ValueError(f"Failed to encode image to base64: {e}")
+
+def _handle_image_input(image_path: str = None, image_base64: str = None) -> str:
+    """Handle image input from either file path or base64 data.
+
+    Args:
+        image_path: Path to image file (optional)
+        image_base64: Base64 encoded image (optional)
+
+    Returns:
+        Resolved absolute path to the image file
+    """
+    if image_base64:
+        # Base64 image provided - save it and return path
+        return _save_base64_image(image_base64)
+    elif image_path:
+        # File path provided - resolve it
+        return _get_local_file_path(image_path)
+    else:
+        return None
 
 def load_config():
     config = {
@@ -560,11 +775,66 @@ def generate_stable_diffusion_image(prompt: str, model: str = "sd15", output_dir
             lora_model_dir = config.get("lora_model_dir")
 
         # Validate and auto-correct LoRA files if prompt contains LoRA tags
-        if lora_model_dir:
-            sanitized_prompt, lora_error = validate_and_correct_loras(sanitized_prompt, lora_model_dir)
-            if lora_error:
-                logging.error(lora_error)
-                return {"success": False, "error": lora_error}
+        lora_pattern = r'<lora:([^:>]+):([^>]+)>'
+        lora_matches = re.findall(lora_pattern, sanitized_prompt)
+        if lora_matches and lora_model_dir:
+            # Check if the LoRA directory exists
+            if not os.path.isdir(lora_model_dir):
+                error_msg = f"LoRA directory does not exist: {lora_model_dir}"
+                logging.error(error_msg)
+                return {"success": False, "error": error_msg}
+
+            # Validate and auto-correct LoRA names
+            # stable-diffusion.cpp does exact case-sensitive filename matching
+            lora_files = os.listdir(lora_model_dir)
+            missing_loras = []
+            lora_replacements = []  # Track corrections to apply to prompt
+
+            for lora_name, lora_weight in lora_matches:
+                # Step 1: Try exact match
+                exact_safetensors = f"{lora_name}.safetensors"
+                exact_ckpt = f"{lora_name}.ckpt"
+
+                if exact_safetensors in lora_files:
+                    logging.info(f"LoRA exact match: {exact_safetensors}")
+                    continue  # No correction needed
+                elif exact_ckpt in lora_files:
+                    logging.info(f"LoRA exact match: {exact_ckpt}")
+                    continue  # No correction needed
+
+                # Step 2: Exact match failed - try fuzzy matching
+                normalized_name = lora_name.lower().replace(" ", "").replace("_", "").replace("-", "")
+                fuzzy_match = None
+
+                for lora_file in lora_files:
+                    if lora_file.endswith((".safetensors", ".ckpt")):
+                        file_base = lora_file.rsplit(".", 1)[0]
+                        file_normalized = file_base.lower().replace(" ", "").replace("_", "").replace("-", "")
+                        if normalized_name == file_normalized:
+                            fuzzy_match = file_base
+                            break
+
+                # Step 3: If fuzzy match found, auto-correct the prompt
+                if fuzzy_match:
+                    old_tag = f"<lora:{lora_name}:{lora_weight}>"
+                    new_tag = f"<lora:{fuzzy_match}:{lora_weight}>"
+                    lora_replacements.append((old_tag, new_tag))
+                    logging.warning(f"LoRA auto-corrected: '{lora_name}' → '{fuzzy_match}'")
+                    continue  # Fuzzy match successful, skip to next LoRA
+                else:
+                    # Step 4: No match at all - this is a real error
+                    missing_loras.append(lora_name)
+
+            # Apply all LoRA corrections to the prompt
+            for old_tag, new_tag in lora_replacements:
+                sanitized_prompt = sanitized_prompt.replace(old_tag, new_tag)
+
+            # If any LoRAs genuinely don't exist, return error
+            if missing_loras:
+                available_loras = [f.rsplit(".", 1)[0] for f in lora_files if f.endswith((".safetensors", ".ckpt"))]
+                error_msg = f"LoRA file(s) not found: {', '.join(missing_loras)}. Available LoRAs: {', '.join(available_loras)}"
+                logging.error(error_msg)
+                return {"success": False, "error": error_msg}
 
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
@@ -1230,11 +1500,66 @@ def generate_flux_image(prompt: str, output_dir: str = None, cfg_scale: float = 
             lora_model_dir = config.get("lora_model_dir")
 
         # Validate and auto-correct LoRA files if prompt contains LoRA tags
-        if lora_model_dir:
-            sanitized_prompt, lora_error = validate_and_correct_loras(sanitized_prompt, lora_model_dir)
-            if lora_error:
-                logging.error(lora_error)
-                return {"success": False, "error": lora_error}
+        lora_pattern = r'<lora:([^:>]+):([^>]+)>'
+        lora_matches = re.findall(lora_pattern, sanitized_prompt)
+        if lora_matches and lora_model_dir:
+            # Check if the LoRA directory exists
+            if not os.path.isdir(lora_model_dir):
+                error_msg = f"LoRA directory does not exist: {lora_model_dir}"
+                logging.error(error_msg)
+                return {"success": False, "error": error_msg}
+
+            # Validate and auto-correct LoRA names
+            # stable-diffusion.cpp does exact case-sensitive filename matching
+            lora_files = os.listdir(lora_model_dir)
+            missing_loras = []
+            lora_replacements = []  # Track corrections to apply to prompt
+
+            for lora_name, lora_weight in lora_matches:
+                # Step 1: Try exact match
+                exact_safetensors = f"{lora_name}.safetensors"
+                exact_ckpt = f"{lora_name}.ckpt"
+
+                if exact_safetensors in lora_files:
+                    logging.info(f"LoRA exact match: {exact_safetensors}")
+                    continue  # No correction needed
+                elif exact_ckpt in lora_files:
+                    logging.info(f"LoRA exact match: {exact_ckpt}")
+                    continue  # No correction needed
+
+                # Step 2: Exact match failed - try fuzzy matching
+                normalized_name = lora_name.lower().replace(" ", "").replace("_", "").replace("-", "")
+                fuzzy_match = None
+
+                for lora_file in lora_files:
+                    if lora_file.endswith((".safetensors", ".ckpt")):
+                        file_base = lora_file.rsplit(".", 1)[0]
+                        file_normalized = file_base.lower().replace(" ", "").replace("_", "").replace("-", "")
+                        if normalized_name == file_normalized:
+                            fuzzy_match = file_base
+                            break
+
+                # Step 3: If fuzzy match found, auto-correct the prompt
+                if fuzzy_match:
+                    old_tag = f"<lora:{lora_name}:{lora_weight}>"
+                    new_tag = f"<lora:{fuzzy_match}:{lora_weight}>"
+                    lora_replacements.append((old_tag, new_tag))
+                    logging.warning(f"LoRA auto-corrected: '{lora_name}' → '{fuzzy_match}'")
+                    continue  # Fuzzy match successful, skip to next LoRA
+                else:
+                    # Step 4: No match at all - this is a real error
+                    missing_loras.append(lora_name)
+
+            # Apply all LoRA corrections to the prompt
+            for old_tag, new_tag in lora_replacements:
+                sanitized_prompt = sanitized_prompt.replace(old_tag, new_tag)
+
+            # If any LoRAs genuinely don't exist, return error
+            if missing_loras:
+                available_loras = [f.rsplit(".", 1)[0] for f in lora_files if f.endswith((".safetensors", ".ckpt"))]
+                error_msg = f"LoRA file(s) not found: {', '.join(missing_loras)}. Available LoRAs: {', '.join(available_loras)}"
+                logging.error(error_msg)
+                return {"success": False, "error": error_msg}
 
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
