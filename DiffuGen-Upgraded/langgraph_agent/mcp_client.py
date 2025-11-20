@@ -3,11 +3,61 @@ DiffuGen MCP Client
 Wrapper for calling DiffuGen MCP tools from LangGraph
 """
 
+import asyncio
 import logging
 from typing import Optional, Dict, Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+async def retry_with_backoff(
+    func,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 10.0,
+    exponential_base: float = 2.0
+):
+    """
+    Retry a function with exponential backoff
+
+    Args:
+        func: Async function to retry
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay in seconds
+        exponential_base: Base for exponential backoff
+
+    Returns:
+        Function result if successful
+
+    Raises:
+        Last exception if all retries fail
+    """
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except (httpx.ConnectError, httpx.ReadTimeout) as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                delay = min(base_delay * (exponential_base ** attempt), max_delay)
+                logger.warning(
+                    f"Request failed (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"All {max_retries} retry attempts failed")
+                raise
+        except Exception as e:
+            # Don't retry on other exceptions (e.g., validation errors)
+            logger.error(f"Non-retryable error: {e}")
+            raise
+
+    # Should never reach here, but just in case
+    raise last_exception
 
 
 class DiffuGenMCPClient:
@@ -55,7 +105,7 @@ class DiffuGenMCPClient:
 
         logger.info(f"MCP Call: refine_image(prompt='{prompt[:50]}...', base64_len={len(init_image_base64)})")
 
-        try:
+        async def _make_request():
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
                     f"{self.base_url}/refine_image",
@@ -71,8 +121,10 @@ class DiffuGenMCPClient:
 
                 return result
 
+        try:
+            return await retry_with_backoff(_make_request, max_retries=2)
         except httpx.TimeoutException:
-            logger.error("refine_image timed out")
+            logger.error("refine_image timed out after all retries")
             return {
                 "success": False,
                 "error": "Generation timed out after 5 minutes"
@@ -103,22 +155,25 @@ class DiffuGenMCPClient:
             "model": model,
             "width": width,
             "height": height,
-            "negative_prompt": "",
+            "negative_prompt": kwargs.get("negative_prompt", ""),
             "return_base64": return_base64,
         }
 
         if steps:
             payload["steps"] = steps
-        # Remove 'lora' from kwargs if it exists, as it's handled in the prompt
-        if 'lora' in kwargs:
-            del kwargs['lora']
+        if cfg_scale:
+            payload["cfg_scale"] = cfg_scale
+
+        # Handle LoRA properly - it's already in the prompt with <lora:name:weight> syntax
+        # Remove it from kwargs to avoid duplication
+        clean_kwargs = {k: v for k, v in kwargs.items() if k not in ['lora', 'negative_prompt']}
 
         # Add any additional parameters
-        payload.update(kwargs)
+        payload.update(clean_kwargs)
 
         logger.info(f"MCP Call: generate_image(prompt='{prompt[:50]}...', model={model})")
 
-        try:
+        async def _make_request():
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
                     f"{self.base_url}/generate/stable",
@@ -134,8 +189,10 @@ class DiffuGenMCPClient:
 
                 return result
 
+        try:
+            return await retry_with_backoff(_make_request, max_retries=2)
         except httpx.TimeoutException:
-            logger.error("generate_image timed out")
+            logger.error("generate_image timed out after all retries")
             return {
                 "success": False,
                 "error": "Generation timed out after 5 minutes"

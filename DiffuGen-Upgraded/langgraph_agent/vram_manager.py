@@ -1,6 +1,6 @@
 """
-VRAM Orchestration Manager
-Handles explicit model loading/unloading to fit LLM + Diffusion in 8GB VRAM
+VRAM Orchestration Manager (Honest Implementation)
+Currently provides phase tracking only - actual VRAM management is TODO
 """
 
 import os
@@ -14,184 +14,269 @@ logger = logging.getLogger(__name__)
 
 class VRAMOrchestrator:
     """
-    Manages VRAM allocation between vLLM (Qwen3) and DiffuGen (Stable Diffusion)
+    VRAM Manager for LangGraph workflow
 
-    8GB VRAM Budget:
-    - Qwen3-8B-AWQ: ~4GB
-    - Stable Diffusion: ~4GB
-    - Strategy: Never run both simultaneously
+    CURRENT STATUS: Phase tracking only
+
+    This class currently tracks which phase we're in (LLM vs Diffusion) but does NOT
+    actually manage VRAM. Both vLLM and DiffuGen can run simultaneously.
+
+    FUTURE: Implement actual VRAM management strategies:
+    1. Container stop/start for model switching
+    2. Model-specific VRAM limits
+    3. Dynamic model loading/unloading
+    4. Queue-based request scheduling
+
+    For now, this provides a clean interface for future implementation.
     """
 
     def __init__(
         self,
         vllm_base_url: str,
         diffugen_base_url: str,
-        enable_orchestration: bool = True
+        enable_orchestration: bool = False  # Default to False until implemented
     ):
         self.vllm_base_url = vllm_base_url.rstrip('/')
         self.diffugen_base_url = diffugen_base_url.rstrip('/')
         self.enable_orchestration = enable_orchestration
 
-        self.vllm_loaded = True  # vLLM starts loaded by default
-        self.diffugen_loaded = False  # DiffuGen only loads on-demand
+        # Phase tracking (informational only)
+        self.current_phase = "init"
 
-        logger.info(f"VRAM Orchestrator initialized (orchestration={'ON' if enable_orchestration else 'OFF'})")
-        logger.info(f"vLLM: {self.vllm_base_url}")
-        logger.info(f"DiffuGen: {self.diffugen_base_url}")
+        if enable_orchestration:
+            logger.warning(
+                "VRAM orchestration is enabled but NOT YET IMPLEMENTED. "
+                "Both services will run simultaneously. "
+                "Set ENABLE_VRAM_ORCHESTRATION=false to disable this warning."
+            )
+        else:
+            logger.info("VRAM orchestration disabled (phase tracking only)")
+
+        logger.info(f"vLLM URL: {self.vllm_base_url}")
+        logger.info(f"DiffuGen URL: {self.diffugen_base_url}")
 
     async def check_vllm_health(self) -> bool:
-        """Check if Ollama is responsive"""
+        """Check if Ollama/vLLM is responsive"""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                # Try Ollama's API endpoint (remove /v1 from base URL for health check)
+                # Try Ollama's API endpoint
                 base = self.vllm_base_url.replace('/v1', '')
                 response = await client.get(f"{base}/api/tags")
-                return response.status_code == 200
+                is_healthy = response.status_code == 200
+
+                if is_healthy:
+                    logger.debug("vLLM health check: OK")
+                else:
+                    logger.warning(f"vLLM health check failed: HTTP {response.status_code}")
+
+                return is_healthy
         except Exception as e:
-            logger.warning(f"Ollama health check failed: {e}")
+            logger.warning(f"vLLM health check failed: {e}")
             return False
 
     async def check_diffugen_health(self) -> bool:
         """Check if DiffuGen MCP is responsive"""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                # DiffuGen doesn't have /health, so check if it's running
-                # We can't make an actual MCP call here, just check connectivity
                 response = await client.get(
-                    f"{self.diffugen_base_url}/",
+                    f"{self.diffugen_base_url}/health",
                     follow_redirects=True
                 )
-                # Even a 404 means it's alive
-                return response.status_code in [200, 404, 405]
+                # Accept 200, 404, or 405 as "service is running"
+                is_healthy = response.status_code in [200, 404, 405]
+
+                if is_healthy:
+                    logger.debug("DiffuGen health check: OK")
+                else:
+                    logger.warning(f"DiffuGen health check failed: HTTP {response.status_code}")
+
+                return is_healthy
         except Exception as e:
             logger.warning(f"DiffuGen health check failed: {e}")
             return False
 
     async def prepare_for_llm_phase(self):
         """
-        Ensure vLLM is loaded and DiffuGen is unloaded
-        Phase 1: Planning, Critique, Reasoning
+        Prepare for LLM phase (planning, critique, reasoning)
+
+        Currently: Just updates phase tracking
+        Future: Unload diffusion models, ensure LLM is loaded
         """
-        if not self.enable_orchestration:
-            logger.debug("VRAM orchestration disabled, skipping prepare_for_llm_phase")
-            return
+        if self.enable_orchestration:
+            logger.info("=== VRAM Phase: LLM (orchestration not implemented) ===")
+        else:
+            logger.debug("Phase: LLM")
 
-        logger.info("=== VRAM Phase Transition: LLM ===")
+        self.current_phase = "llm"
 
-        # Unload DiffuGen if needed
-        if self.diffugen_loaded:
-            await self.unload_diffugen()
-
-        # Ensure vLLM is loaded
-        if not self.vllm_loaded:
-            await self.load_vllm()
+        # TODO: Implement actual VRAM management here
+        # Options:
+        # 1. docker stop diffugen-mcp && docker start diffugen-ollama
+        # 2. Signal DiffuGen to unload models
+        # 3. Use CUDA IPC for memory management
 
     async def prepare_for_diffusion_phase(self):
         """
-        Ensure DiffuGen is loaded and vLLM is unloaded
-        Phase 2: Image Generation
+        Prepare for Diffusion phase (image generation)
+
+        Currently: Just updates phase tracking
+        Future: Unload LLM, ensure diffusion models loaded
         """
-        if not self.enable_orchestration:
-            logger.debug("VRAM orchestration disabled, skipping prepare_for_diffusion_phase")
-            return
+        if self.enable_orchestration:
+            logger.info("=== VRAM Phase: DIFFUSION (orchestration not implemented) ===")
+        else:
+            logger.debug("Phase: DIFFUSION")
 
-        logger.info("=== VRAM Phase Transition: DIFFUSION ===")
+        self.current_phase = "diffusion"
 
-        # Unload vLLM to free ~4GB
-        if self.vllm_loaded:
-            await self.unload_vllm()
-
-        # Load DiffuGen (stable-diffusion.cpp loads models on-demand, so this is lightweight)
-        if not self.diffugen_loaded:
-            await self.load_diffugen()
-
-    async def unload_vllm(self):
-        """
-        Unload vLLM from VRAM
-
-        NOTE: vLLM doesn't have a built-in unload API yet.
-        Workaround options:
-        1. Stop/start the container (slow but works)
-        2. Use CUDA memory management tricks
-        3. Accept that vLLM stays loaded (less optimal)
-
-        For now, we'll mark it as unloaded and add a sleep to simulate
-        In production, you'd implement one of the above strategies.
-        """
-        logger.warning("vLLM unload requested - vLLM doesn't support dynamic unloading")
-        logger.info("Consider: docker stop diffugen-vllm (manual VRAM release)")
-
-        # Placeholder for future implementation
-        # TODO: Implement actual VRAM release strategy
-        # Option 1: Container stop/start
-        # Option 2: CUDA IPC tricks
-        # Option 3: Multiple vLLM instances with routing
-
-        self.vllm_loaded = False
-        await asyncio.sleep(0.1)  # Placeholder
-
-    async def load_vllm(self):
-        """Load vLLM back into VRAM"""
-        logger.info("vLLM load requested - waiting for service to be ready")
-
-        # Placeholder for future implementation
-        # TODO: Implement actual model loading
-        # This would restart the container or trigger model loading
-
-        # Wait for vLLM to be healthy
-        for _ in range(30):  # 30 second timeout
-            if await self.check_vllm_health():
-                logger.info("vLLM is loaded and healthy")
-                self.vllm_loaded = True
-                return
-            await asyncio.sleep(1)
-
-        raise RuntimeError("Failed to load vLLM - service not responding")
-
-    async def unload_diffugen(self):
-        """
-        Unload DiffuGen from VRAM
-
-        stable-diffusion.cpp loads models on-demand, so we just mark it unloaded
-        The actual VRAM is freed when the generation process completes
-        """
-        logger.info("DiffuGen marked as unloaded (VRAM freed after generation)")
-        self.diffugen_loaded = False
-        await asyncio.sleep(0.1)  # Ensure generation process has exited
-
-    async def load_diffugen(self):
-        """
-        Prepare DiffuGen for image generation
-
-        stable-diffusion.cpp loads models on first use, so this is mostly
-        a marker that we're entering the diffusion phase
-        """
-        logger.info("DiffuGen prepared for generation (model loads on-demand)")
-        self.diffugen_loaded = True
-        await asyncio.sleep(0.1)
+        # TODO: Implement actual VRAM management here
+        # Options:
+        # 1. docker stop diffugen-ollama && docker start diffugen-mcp
+        # 2. Signal Ollama to free memory
+        # 3. Use model-specific VRAM limits
 
     def get_vram_status(self) -> dict:
-        """Get current VRAM allocation status"""
+        """Get current phase tracking status"""
         return {
-            "vllm_loaded": self.vllm_loaded,
-            "diffugen_loaded": self.diffugen_loaded,
-            "current_phase": "llm" if self.vllm_loaded else "diffusion",
-            "orchestration_enabled": self.enable_orchestration
+            "current_phase": self.current_phase,
+            "orchestration_enabled": self.enable_orchestration,
+            "orchestration_implemented": False,  # Honest reporting
+            "note": "Phase tracking only - both services run simultaneously"
         }
 
 
-# Decorator for automatic VRAM management
+# Decorator for phase transitions (informational)
 def requires_llm_phase(func):
-    """Decorator to ensure LLM is loaded before execution"""
+    """
+    Decorator to mark LLM phase functions
+
+    Currently: Just logs phase transition
+    Future: Will enforce VRAM orchestration
+    """
     async def wrapper(self, *args, **kwargs):
         await self.vram_manager.prepare_for_llm_phase()
         return await func(self, *args, **kwargs)
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
     return wrapper
 
 
 def requires_diffusion_phase(func):
-    """Decorator to ensure Diffusion is loaded before execution"""
+    """
+    Decorator to mark Diffusion phase functions
+
+    Currently: Just logs phase transition
+    Future: Will enforce VRAM orchestration
+    """
     async def wrapper(self, *args, **kwargs):
         await self.vram_manager.prepare_for_diffusion_phase()
         return await func(self, *args, **kwargs)
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
     return wrapper
+
+
+# Implementation guide for future developers
+VRAM_IMPLEMENTATION_GUIDE = """
+# VRAM Orchestration Implementation Guide
+
+## Current Status
+Phase tracking only - no actual VRAM management
+
+## Why Not Implemented Yet?
+1. Both services need to be available for OpenWebUI integration
+2. Complexity vs benefit trade-off (is 8GB limit a real constraint?)
+3. Multiple valid implementation approaches
+
+## Implementation Options
+
+### Option 1: Container-Based (Simplest)
+```python
+async def unload_vllm(self):
+    # Stop Ollama container
+    subprocess.run(["docker", "stop", "diffugen-ollama"])
+
+async def load_vllm(self):
+    # Start Ollama container
+    subprocess.run(["docker", "start", "diffugen-ollama"])
+    # Wait for health check
+```
+
+**Pros**: Simple, guaranteed VRAM release
+**Cons**: Slow (10-30s startup), breaks concurrent requests
+
+### Option 2: Model API (Most Flexible)
+```python
+async def unload_vllm(self):
+    # Call Ollama API to unload model
+    await client.post(f"{ollama_url}/api/unload", json={"model": "qwen2.5"})
+
+async def load_vllm(self):
+    # Trigger model load via generation
+    await client.post(f"{ollama_url}/api/generate", json={"model": "qwen2.5", "prompt": "test"})
+```
+
+**Pros**: Fast, granular control
+**Cons**: Requires API support (Ollama doesn't have unload API yet)
+
+### Option 3: CUDA Memory Management (Advanced)
+```python
+import torch
+
+async def unload_vllm(self):
+    # Free CUDA memory
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+```
+
+**Pros**: No service interruption
+**Cons**: Not guaranteed to free memory, requires PyTorch access
+
+### Option 4: Queue-Based (Production-Grade)
+```python
+class VRAMQueue:
+    def __init__(self):
+        self.llm_queue = asyncio.Queue()
+        self.diffusion_queue = asyncio.Queue()
+        self.current_mode = None
+
+    async def request_llm(self):
+        await self.llm_queue.put(Request())
+        # Switch mode if needed
+        # Process queue
+
+    async def request_diffusion(self):
+        # Similar pattern
+```
+
+**Pros**: Handles concurrency, optimal resource use
+**Cons**: Complex, requires significant refactoring
+
+## Recommended Approach
+
+For 8GB VRAM constraint:
+1. Start with Option 4 (Queue-Based)
+2. Use container stop/start initially
+3. Migrate to API-based once Ollama supports it
+
+For 16GB+ VRAM:
+- Disable orchestration entirely
+- Run both services simultaneously
+- Much simpler and faster
+
+## Testing Checklist
+
+When implementing, test:
+- [ ] Sequential LLM → Diffusion → LLM works
+- [ ] Concurrent requests queue properly
+- [ ] VRAM is actually freed (nvidia-smi monitoring)
+- [ ] No memory leaks over 100+ requests
+- [ ] Startup/shutdown graceful handling
+- [ ] Error recovery (what if container won't start?)
+"""
+
+if __name__ == "__main__":
+    # Print implementation guide
+    print(VRAM_IMPLEMENTATION_GUIDE)
