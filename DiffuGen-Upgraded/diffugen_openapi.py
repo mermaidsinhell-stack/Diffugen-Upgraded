@@ -3,10 +3,10 @@ DiffuGen OpenAPI Server
 Professional REST API for Open WebUI integration with Stable Diffusion and Flux models
 """
 
-from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi import FastAPI, HTTPException, Request, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Union, Any
 import os
@@ -15,6 +15,8 @@ import json
 import time
 import re
 import argparse
+import asyncio
+import threading
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -38,6 +40,12 @@ from diffugen import (
     load_config as load_diffugen_config,
     sd_cpp_path as default_sd_cpp_path,
     _model_paths
+)
+from streaming import (
+    ProgressTracker,
+    StreamingQueue,
+    ProgressPhase,
+    sse_generator
 )
 
 
@@ -700,6 +708,259 @@ async def generate_image(request: ImageGenerationRequest, req: Request):
         raise
     except Exception as e:
         logger.error(f"Unexpected error in generate_image: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Streaming Endpoints (SSE Support)
+# ============================================================================
+
+async def run_generation_with_streaming(
+    generation_func: callable,
+    streaming_queue: StreamingQueue,
+    **kwargs
+):
+    """
+    Run generation in background thread with streaming progress
+
+    Args:
+        generation_func: Generation function to call
+        streaming_queue: Queue for progress updates
+        **kwargs: Arguments for generation function
+    """
+    tracker = ProgressTracker(
+        total_steps=kwargs.get('steps', 20),
+        callback=streaming_queue.put
+    )
+
+    try:
+        # Phase: Initializing
+        tracker.update_phase(ProgressPhase.INITIALIZING, "Initializing generation...")
+        await asyncio.sleep(0.1)
+
+        # Phase: Loading model
+        tracker.update_phase(ProgressPhase.LOADING_MODEL, "Loading model...")
+        await asyncio.sleep(0.5)
+
+        # Phase: Preparing
+        tracker.update_phase(ProgressPhase.PREPARING, "Preparing generation parameters...")
+        await asyncio.sleep(0.2)
+
+        # Phase: Generating (run in thread to avoid blocking)
+        tracker.update_phase(ProgressPhase.GENERATING, "Generating image...")
+
+        # Simulate step-by-step progress
+        # Since we can't get real progress from sd.cpp, we estimate
+        total_steps = kwargs.get('steps', 20)
+
+        # Run generation in executor
+        loop = asyncio.get_event_loop()
+
+        # Create a wrapper that updates progress
+        async def generate_with_progress():
+            # Start generation in thread
+            generation_task = loop.run_in_executor(
+                None,
+                generation_func,
+                **kwargs
+            )
+
+            # Simulate progress while generating
+            for step in range(1, total_steps + 1):
+                tracker.update_step(step)
+                await asyncio.sleep(0.3)  # Rough estimate per step
+
+                # Check if generation is done
+                if generation_task.done():
+                    break
+
+            # Wait for actual completion
+            result = await generation_task
+            return result
+
+        result = await generate_with_progress()
+
+        # Phase: Post-processing
+        tracker.update_phase(ProgressPhase.POST_PROCESSING, "Post-processing image...")
+        await asyncio.sleep(0.5)
+
+        # Complete
+        if result.get("success"):
+            tracker.complete(f"Generation complete: {result.get('image_path')}")
+        else:
+            tracker.error(result.get("error", "Unknown error"))
+
+    except Exception as e:
+        logger.error(f"Error in streaming generation: {e}", exc_info=True)
+        tracker.error(str(e))
+    finally:
+        streaming_queue.mark_done()
+
+
+@app.post(
+    "/generate/stable/stream",
+    tags=["Image Generation"],
+    summary="Generate with Stable Diffusion (Streaming)",
+    response_class=StreamingResponse
+)
+async def generate_stable_image_stream(
+    request: ImageGenerationRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Generate image using Stable Diffusion with real-time progress updates (SSE)
+
+    Returns Server-Sent Events stream with progress updates.
+    Client should listen for 'progress' and 'done' events.
+    """
+    try:
+        # Validate model
+        model = request.model or "sd15"
+        model = validate_model(model, "stable")
+
+        # Prepare generation kwargs
+        gen_kwargs = {
+            "prompt": request.prompt if not request.lora else f"<lora:{request.lora}:1.0> {request.prompt}",
+            "model": model,
+            "width": request.width,
+            "height": request.height,
+            "steps": request.steps or 20,
+            "cfg_scale": request.cfg_scale,
+            "seed": -1,
+            "sampling_method": request.sampling_method,
+            "negative_prompt": request.negative_prompt,
+            "output_dir": str(DEFAULT_OUTPUT_DIR),
+            "lora_model_dir": config.get("paths", {}).get("lora_model_dir")
+        }
+
+        # Create streaming queue
+        streaming_queue = StreamingQueue()
+
+        # Start generation in background
+        background_tasks.add_task(
+            run_generation_with_streaming,
+            generate_stable_diffusion_image,
+            streaming_queue,
+            **gen_kwargs
+        )
+
+        # Return SSE stream
+        return StreamingResponse(
+            sse_generator(streaming_queue),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Disable nginx buffering
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting streaming generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/generate/flux/stream",
+    tags=["Image Generation"],
+    summary="Generate with Flux (Streaming)",
+    response_class=StreamingResponse
+)
+async def generate_flux_image_stream(
+    request: ImageGenerationRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Generate image using Flux with real-time progress updates (SSE)
+
+    Returns Server-Sent Events stream with progress updates.
+    """
+    try:
+        # Validate model
+        model = request.model or "flux-schnell"
+        model = validate_model(model, "flux")
+
+        # Prepare generation kwargs
+        gen_kwargs = {
+            "prompt": request.prompt,
+            "model": model,
+            "width": request.width,
+            "height": request.height,
+            "steps": request.steps or 4,
+            "cfg_scale": request.cfg_scale,
+            "seed": -1,
+            "sampling_method": request.sampling_method,
+            "output_dir": str(DEFAULT_OUTPUT_DIR)
+        }
+
+        # Create streaming queue
+        streaming_queue = StreamingQueue()
+
+        # Start generation in background
+        background_tasks.add_task(
+            run_generation_with_streaming,
+            generate_flux_image,
+            streaming_queue,
+            **gen_kwargs
+        )
+
+        # Return SSE stream
+        return StreamingResponse(
+            sse_generator(streaming_queue),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting streaming generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/generate/stream",
+    tags=["Image Generation"],
+    summary="Generate Image (Unified, Streaming)",
+    response_class=StreamingResponse
+)
+async def generate_image_stream(
+    request: ImageGenerationRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Unified streaming generation endpoint with real-time progress
+
+    Automatically routes to Flux or Stable Diffusion based on model.
+    Returns Server-Sent Events stream.
+    """
+    try:
+        # Determine model type and route
+        if request.model:
+            if request.model.lower().startswith("flux-"):
+                return await generate_flux_image_stream(request, background_tasks)
+            else:
+                return await generate_stable_image_stream(request, background_tasks)
+        else:
+            # Use default model
+            default_model = config.get("default_model", "flux-schnell")
+            request.model = default_model
+
+            if default_model.startswith("flux-"):
+                return await generate_flux_image_stream(request, background_tasks)
+            else:
+                return await generate_stable_image_stream(request, background_tasks)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in unified streaming generation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

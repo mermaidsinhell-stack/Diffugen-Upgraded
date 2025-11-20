@@ -22,6 +22,12 @@ from diffugen_core import (
     encode_image_to_base64,
     handle_image_input
 )
+from streaming import (
+    ProgressTracker,
+    StreamingQueue,
+    ProgressPhase,
+    create_sse_message
+)
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +416,139 @@ class OpenWebUIIntegrationService:
                 detail=f"Internal server error: {str(e)}"
             )
 
+    async def generate_image_stream(
+        self,
+        request: OpenAIImageGenerationRequest,
+        base_url: str
+    ):
+        """
+        Generate image with streaming progress (SSE)
+
+        Args:
+            request: OpenAI-compatible request
+            base_url: Base URL for image serving
+
+        Yields:
+            SSE formatted progress updates
+        """
+        streaming_queue = StreamingQueue()
+
+        try:
+            # Resolve model
+            model = request.model or "stable-diffusion-xl"
+            model_info = self.get_model_info(model)
+
+            if not model_info:
+                error_msg = f"Model '{model}' not found. Available models: {', '.join(self.models.keys())}"
+                streaming_queue.put(
+                    ProgressUpdate(
+                        phase=ProgressPhase.ERROR,
+                        progress=0,
+                        message=error_msg
+                    )
+                )
+                streaming_queue.mark_done()
+                return
+
+            internal_model = model_info["internal_name"]
+            width, height = self.parse_size(request.size)
+
+            # Validate size
+            max_w, max_h = model_info["max_size"]
+            if width > max_w or height > max_h:
+                error_msg = f"Size {request.size} exceeds maximum {max_w}x{max_h} for model {model}"
+                streaming_queue.put(
+                    ProgressUpdate(
+                        phase=ProgressPhase.ERROR,
+                        progress=0,
+                        message=error_msg
+                    )
+                )
+                streaming_queue.mark_done()
+                return
+
+            # Build DiffuGen request
+            diffugen_req = {
+                "prompt": request.prompt,
+                "model": internal_model,
+                "width": width,
+                "height": height,
+                "seed": request.seed or -1,
+                "return_base64": request.response_format == "b64_json"
+            }
+
+            # Add optional parameters
+            if request.negative_prompt:
+                diffugen_req["negative_prompt"] = request.negative_prompt
+            if request.steps:
+                diffugen_req["steps"] = request.steps
+            if request.cfg_scale:
+                diffugen_req["cfg_scale"] = request.cfg_scale
+            if request.sampling_method:
+                diffugen_req["sampling_method"] = request.sampling_method
+            if request.lora:
+                diffugen_req["lora"] = request.lora
+
+            # Call DiffuGen streaming endpoint
+            logger.info(f"Streaming generation: model={internal_model}, size={width}x{height}")
+
+            endpoint = "/generate/flux/stream" if "flux" in internal_model else "/generate/stable/stream"
+
+            # Stream from DiffuGen
+            async with self.client.stream(
+                "POST",
+                f"{self.diffugen_base_url}{endpoint}",
+                json=diffugen_req,
+                timeout=300.0
+            ) as response:
+                if response.status_code != 200:
+                    error_detail = "Streaming generation failed"
+                    streaming_queue.put(
+                        ProgressUpdate(
+                            phase=ProgressPhase.ERROR,
+                            progress=0,
+                            message=error_detail
+                        )
+                    )
+                    streaming_queue.mark_done()
+                    return
+
+                # Forward SSE events
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        try:
+                            data_str = line[5:].strip()
+                            data = json.loads(data_str)
+
+                            # Forward progress update
+                            if "phase" in data:
+                                from streaming import ProgressUpdate
+                                update = ProgressUpdate(
+                                    phase=ProgressPhase(data["phase"]),
+                                    progress=data["progress"],
+                                    message=data["message"],
+                                    step=data.get("step"),
+                                    total_steps=data.get("total_steps"),
+                                    eta_seconds=data.get("eta_seconds"),
+                                    timestamp=data.get("timestamp")
+                                )
+                                streaming_queue.put(update)
+
+                        except Exception as e:
+                            logger.error(f"Error parsing SSE data: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in streaming generation: {e}", exc_info=True)
+            streaming_queue.put(
+                ProgressUpdate(
+                    phase=ProgressPhase.ERROR,
+                    progress=0,
+                    message=f"Internal server error: {str(e)}"
+                )
+            )
+        finally:
+            streaming_queue.mark_done()
+
     async def close(self):
         """Clean up resources"""
         await self.client.aclose()
@@ -461,6 +600,43 @@ def create_openwebui_router(
         """
         base_url = service.public_url or "http://localhost:8000"
         return await service.edit_image(request, base_url)
+
+    @router.post(
+        "/v1/images/generations/stream",
+        response_class=StreamingResponse
+    )
+    async def generate_images_stream(
+        request: OpenAIImageGenerationRequest,
+        background_tasks: BackgroundTasks
+    ):
+        """
+        Generate images with real-time progress updates (SSE)
+
+        Returns Server-Sent Events stream with progress updates.
+        Compatible with OpenAI's streaming format.
+        """
+        base_url = service.public_url or "http://localhost:8000"
+
+        # Create streaming queue
+        streaming_queue = StreamingQueue()
+
+        # Start streaming generation in background
+        async def stream_generation():
+            await service.generate_image_stream(request, base_url)
+
+        background_tasks.add_task(stream_generation)
+
+        # Return SSE stream
+        from streaming import sse_generator
+        return StreamingResponse(
+            sse_generator(streaming_queue),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     @router.get("/health")
     async def health_check():
